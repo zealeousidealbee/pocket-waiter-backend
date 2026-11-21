@@ -1,25 +1,28 @@
-from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
-from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.orm import Session
-from typing import List
-from pydantic import BaseModel
+#DONE RIGHT
 
-from database.db import engine, Base, get_db
-from models import user, menu, table, order
-from schemas.menu import MenuItemCreate, MenuItemResponse
+from datetime import datetime
+from typing import List, Literal, Optional
+
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
 from auth import (
-    hash_password,
-    verify_password,
     create_access_token,
     get_current_user,
+    hash_password,
     require_role,
+    verify_password,
 )
-from ws_manager import manager, authenticate_ws_token
+from database.db import Base, engine, get_db
+from models import menu, order, table, user
+from schemas.menu import MenuItemCreate, MenuItemResponse
+from ws_manager import authenticate_ws_token, manager
 
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Pocket Waiter API", version="1.0.0")
-
 
 
 class UserRegister(BaseModel):
@@ -44,7 +47,6 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-
 class CategoryCreate(BaseModel):
     name: str
 
@@ -54,6 +56,16 @@ class CategoryResponse(CategoryCreate):
 
     class Config:
         from_attributes = True
+
+
+class MenuItemUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    price: Optional[float] = None
+    ingredients: Optional[str] = None
+    allergens: Optional[str] = None
+    is_available: Optional[bool] = None
+    category_id: Optional[int] = None
 
 
 class TableCreate(BaseModel):
@@ -82,13 +94,43 @@ class OrderCreate(BaseModel):
 
 class OrderResponse(BaseModel):
     id: int
+    user_id: Optional[int] = None
     table_number: int
     status: str
     total_price: float
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
 
+
+class ReservationCreate(BaseModel):
+    table_id: int
+    guest_count: int
+    reservation_time: datetime
+
+
+OrderStatus = Literal["NEW", "IN_PROGRESS", "READY", "SERVED", "PAID", "CANCELLED"]
+ReservationStatus = Literal["pending", "confirmed", "cancelled", "completed"]
+
+
+class ReservationStatusUpdate(BaseModel):
+    status: ReservationStatus = Field(
+        ...,
+        description="Allowed reservation statuses: pending, confirmed, cancelled, completed",
+    )
+
+
+class ReservationResponse(BaseModel):
+    id: int
+    user_id: Optional[int] = None
+    table_id: int
+    guest_count: int
+    reservation_time: datetime
+    status: str
+
+    class Config:
+        from_attributes = True
 
 
 @app.post("/auth/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
@@ -152,10 +194,9 @@ def read_current_user(current_user: user.User = Depends(get_current_user)):
     return current_user
 
 
-
 @app.get("/")
-def read_root():
-    return {"message": "Welcome to Pocket Waiter API! All systems go."}
+def root():
+    return {"message": "Pocket Waiter API is running"}
 
 
 @app.post("/categories/", response_model=CategoryResponse)
@@ -185,8 +226,37 @@ def create_menu_item(
 
 
 @app.get("/menu/", response_model=List[MenuItemResponse])
-def get_menu(db: Session = Depends(get_db)):
-    return db.query(menu.MenuItem).all()
+def get_menu(
+    category_id: Optional[int] = None,
+    only_available: bool = False,
+    db: Session = Depends(get_db),
+):
+    query = db.query(menu.MenuItem)
+    if category_id is not None:
+        query = query.filter(menu.MenuItem.category_id == category_id)
+    if only_available:
+        query = query.filter(menu.MenuItem.is_available.is_(True))
+    return query.all()
+
+
+@app.patch("/menu/{item_id}", response_model=MenuItemResponse)
+def update_menu_item(
+    item_id: int,
+    item_update: MenuItemUpdate,
+    db: Session = Depends(get_db),
+    _: user.User = Depends(require_role(["WAITER", "ADMIN"])),
+):
+    db_item = db.query(menu.MenuItem).filter(menu.MenuItem.id == item_id).first()
+    if not db_item:
+        raise HTTPException(status_code=404, detail="Menu item not found")
+
+    update_data = item_update.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(db_item, field, value)
+
+    db.commit()
+    db.refresh(db_item)
+    return db_item
 
 
 @app.post("/tables/", response_model=TableResponse)
@@ -208,7 +278,11 @@ def get_tables(db: Session = Depends(get_db)):
 
 
 @app.post("/orders/", response_model=OrderResponse)
-async def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
+async def create_order(
+    ord_data: OrderCreate,
+    db: Session = Depends(get_db),
+    current_user: user.User = Depends(get_current_user),
+):
     db_table = (
         db.query(table.Table)
         .filter(table.Table.number == ord_data.table_number)
@@ -223,7 +297,11 @@ async def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
 
     total = 0.0
 
-    db_order = order.Order(table_number=ord_data.table_number, status="NEW")
+    db_order = order.Order(
+        user_id=current_user.id,
+        table_number=ord_data.table_number,
+        status="NEW",
+    )
     db.add(db_order)
     db.commit()
     db.refresh(db_order)
@@ -234,14 +312,24 @@ async def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
             .filter(menu.MenuItem.id == item_data.menu_item_id)
             .first()
         )
-        if menu_item:
-            total += menu_item.price * item_data.quantity
-            db_item = order.OrderItem(
-                order_id=db_order.id,
-                menu_item_id=item_data.menu_item_id,
-                quantity=item_data.quantity,
+        if not menu_item:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Menu item {item_data.menu_item_id} not found",
             )
-            db.add(db_item)
+        if menu_item.is_available is False:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Menu item '{menu_item.name}' is currently unavailable",
+            )
+
+        total += menu_item.price * item_data.quantity
+        db_item = order.OrderItem(
+            order_id=db_order.id,
+            menu_item_id=item_data.menu_item_id,
+            quantity=item_data.quantity,
+        )
+        db.add(db_item)
 
     db_order.total_price = total
     db.commit()
@@ -270,13 +358,17 @@ def get_orders(db: Session = Depends(get_db)):
 @app.patch("/orders/{order_id}/status", response_model=OrderResponse)
 async def update_order_status(
     order_id: int,
-    new_status: str,
+    new_status: OrderStatus = Query(
+        ...,
+        description="Allowed order statuses: NEW, IN_PROGRESS, READY, SERVED, PAID, CANCELLED",
+    ),
     db: Session = Depends(get_db),
     _: user.User = Depends(require_role(["WAITER", "ADMIN"])),
 ):
     db_order = db.query(order.Order).filter(order.Order.id == order_id).first()
     if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
+
     previous_status = (db_order.status or "").strip().upper()
     normalized_status = new_status.strip().upper()
     db_order.status = normalized_status
@@ -321,6 +413,128 @@ async def update_order_status(
     return db_order
 
 
+@app.delete("/orders/{order_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_order(
+    order_id: int,
+    db: Session = Depends(get_db),
+    _: user.User = Depends(require_role(["WAITER", "ADMIN"])),
+):
+    db_order = db.query(order.Order).filter(order.Order.id == order_id).first()
+    if not db_order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    table_num = db_order.table_number
+    was_closed = (db_order.status or "").strip().upper() in {"PAID", "CANCELLED"}
+
+    db.delete(db_order)
+    db.flush()
+
+    if not was_closed:
+        active_orders_count = (
+            db.query(order.Order)
+            .filter(
+                order.Order.table_number == table_num,
+                order.Order.status.notin_(["PAID", "CANCELLED"]),
+            )
+            .count()
+        )
+        if active_orders_count == 0:
+            db_table = (
+                db.query(table.Table)
+                .filter(table.Table.number == table_num)
+                .first()
+            )
+            if db_table is not None:
+                db_table.is_available = True
+
+    db.commit()
+    return None
+
+
+@app.post(
+    "/reservations/",
+    response_model=ReservationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_reservation(
+    res_data: ReservationCreate,
+    db: Session = Depends(get_db),
+    current_user: user.User = Depends(get_current_user),
+):
+    db_table = (
+        db.query(table.Table).filter(table.Table.id == res_data.table_id).first()
+    )
+    if not db_table:
+        raise HTTPException(status_code=404, detail="Table not found")
+    if res_data.guest_count <= 0 or res_data.guest_count > db_table.seats:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Guest count must be between 1 and {db_table.seats}",
+        )
+
+    existing_conflict = (
+        db.query(order.Reservation)
+        .filter(
+            order.Reservation.table_id == res_data.table_id,
+            order.Reservation.reservation_time == res_data.reservation_time,
+            order.Reservation.status.notin_(["cancelled", "completed"]),
+        )
+        .first()
+    )
+    if existing_conflict:
+        raise HTTPException(
+            status_code=409,
+            detail="Table already has a reservation at this time",
+        )
+
+    db_res = order.Reservation(
+        user_id=current_user.id,
+        table_id=res_data.table_id,
+        guest_count=res_data.guest_count,
+        reservation_time=res_data.reservation_time,
+        status="pending",
+    )
+    db.add(db_res)
+    db.commit()
+    db.refresh(db_res)
+    return db_res
+
+
+@app.get("/reservations/", response_model=List[ReservationResponse])
+def get_reservations(
+    db: Session = Depends(get_db),
+    current_user: user.User = Depends(get_current_user),
+):
+    role = (current_user.role or "").upper()
+    if role in {"WAITER", "ADMIN"}:
+        return db.query(order.Reservation).all()
+    return (
+        db.query(order.Reservation)
+        .filter(order.Reservation.user_id == current_user.id)
+        .all()
+    )
+
+
+@app.patch("/reservations/{reservation_id}/status", response_model=ReservationResponse)
+def update_reservation_status(
+    reservation_id: int,
+    status_update: ReservationStatusUpdate,
+    db: Session = Depends(get_db),
+    _: user.User = Depends(require_role(["WAITER", "ADMIN"])),
+):
+    db_res = (
+        db.query(order.Reservation)
+        .filter(order.Reservation.id == reservation_id)
+        .first()
+    )
+    if not db_res:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    db_res.status = status_update.status
+    db.commit()
+    db.refresh(db_res)
+    return db_res
+
 
 @app.websocket("/ws/orders")
 async def orders_websocket(websocket: WebSocket, db: Session = Depends(get_db)):
@@ -343,9 +557,6 @@ async def orders_websocket(websocket: WebSocket, db: Session = Depends(get_db)):
             }
         )
         while True:
-            
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception:
         manager.disconnect(websocket)
