@@ -451,6 +451,33 @@ def delete_order(
     return None
 
 
+def sync_table_availability(db: Session, db_table: table.Table | None) -> None:
+    if db_table is None:
+        return
+
+    has_active_orders = (
+        db.query(order.Order)
+        .filter(
+            order.Order.table_number == db_table.number,
+            order.Order.status.notin_(["PAID", "CANCELLED"]),
+        )
+        .first()
+        is not None
+    )
+
+    has_active_reservations = (
+        db.query(order.Reservation)
+        .filter(
+            order.Reservation.table_id == db_table.id,
+            order.Reservation.status.notin_(["cancelled", "completed"]),
+        )
+        .first()
+        is not None
+    )
+
+    db_table.is_available = not (has_active_orders or has_active_reservations)
+
+
 @app.post(
     "/reservations/",
     response_model=ReservationResponse,
@@ -494,6 +521,7 @@ def create_reservation(
         reservation_time=res_data.reservation_time,
         status="pending",
     )
+    db_table.is_available = False
     db.add(db_res)
     db.commit()
     db.refresh(db_res)
@@ -531,9 +559,45 @@ def update_reservation_status(
         raise HTTPException(status_code=404, detail="Reservation not found")
 
     db_res.status = status_update.status
+    db.flush()
+
+    db_table = (
+        db.query(table.Table).filter(table.Table.id == db_res.table_id).first()
+    )
+    if db_table is not None:
+        if status_update.status in {"pending", "confirmed"}:
+            db_table.is_available = False
+        else:
+            sync_table_availability(db, db_table)
+
     db.commit()
     db.refresh(db_res)
     return db_res
+
+
+@app.delete("/reservations/{reservation_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_reservation(
+    reservation_id: int,
+    db: Session = Depends(get_db),
+    _: user.User = Depends(require_role(["WAITER", "ADMIN"])),
+):
+    db_res = (
+        db.query(order.Reservation)
+        .filter(order.Reservation.id == reservation_id)
+        .first()
+    )
+    if not db_res:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+
+    db_table = (
+        db.query(table.Table).filter(table.Table.id == db_res.table_id).first()
+    )
+    db.delete(db_res)
+    db.flush()
+
+    sync_table_availability(db, db_table)
+    db.commit()
+    return None
 
 
 @app.websocket("/ws/orders")
