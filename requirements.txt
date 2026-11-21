@@ -3,6 +3,8 @@ amqp==5.4.2
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.16.0
+argon2-cffi==25.1.0
+argon2-cffi-bindings==26.2.0
 bcrypt==5.0.0
 billiard==4.3.2
 celery==5.7.0
@@ -24,14 +26,17 @@ opentelemetry-api==1.45.2
 passlib==1.7.4
 prompt_toolkit==3.0.53
 psycopg2-binary==2.9.13
+pwdlib==0.4.2
 pyasn1==0.6.5
 pycparser==3.12
 pydantic==2.14.3
 pydantic-settings==2.16.2
 pydantic_core==2.50.4
+PyJWT==2.15.1
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.4
 python-jose==3.5.0
+python-multipart==0.0.34
 PyYAML==6.0.3
 redis==8.1.0
 rsa==4.9.1
