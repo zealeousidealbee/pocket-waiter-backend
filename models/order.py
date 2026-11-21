@@ -3,6 +3,7 @@ from sqlalchemy.orm import relationship
 from database.db import Base
 import datetime
 
+
 class Reservation(Base):
     __tablename__ = "reservations"
 
@@ -11,18 +12,21 @@ class Reservation(Base):
     table_id = Column(Integer, ForeignKey("tables.id"))
     guest_count = Column(Integer, nullable=False)
     reservation_time = Column(DateTime, nullable=False)
-    status = Column(String, default="pending")  
+    status = Column(String, default="pending")
+
 
 class Order(Base):
     __tablename__ = "orders"
 
     id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     table_number = Column(Integer, nullable=False)
-    status = Column(String, default="NEW")  
+    status = Column(String, default="NEW")
     total_price = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
-    items = relationship("OrderItem", back_populates="order")
+    items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
+
 
 class OrderItem(Base):
     __tablename__ = "order_items"

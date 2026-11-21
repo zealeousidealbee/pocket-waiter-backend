@@ -9,7 +9,7 @@ from models.user import User
 
 class ConnectionManager:
     def __init__(self) -> None:
-        # Храним активные соединения: websocket -> объект пользователя
+        # Store active connections: websocket -> authenticated user object
         self.active_connections: Dict[WebSocket, User] = {}
 
     async def connect(self, websocket: WebSocket, user: User) -> None:

@@ -209,6 +209,18 @@ def get_tables(db: Session = Depends(get_db)):
 
 @app.post("/orders/", response_model=OrderResponse)
 async def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
+    db_table = (
+        db.query(table.Table)
+        .filter(table.Table.number == ord_data.table_number)
+        .first()
+    )
+    if db_table is not None:
+        if not db_table.is_available:
+            raise HTTPException(
+                status_code=400, detail="Table is currently occupied"
+            )
+        db_table.is_available = False
+
     total = 0.0
 
     db_order = order.Order(table_number=ord_data.table_number, status="NEW")
@@ -265,7 +277,32 @@ async def update_order_status(
     db_order = db.query(order.Order).filter(order.Order.id == order_id).first()
     if not db_order:
         raise HTTPException(status_code=404, detail="Order not found")
-    db_order.status = new_status
+    previous_status = (db_order.status or "").strip().upper()
+    normalized_status = new_status.strip().upper()
+    db_order.status = normalized_status
+
+    closed_statuses = {"PAID", "CANCELLED"}
+    db_table = (
+        db.query(table.Table)
+        .filter(table.Table.number == db_order.table_number)
+        .first()
+    )
+
+    if normalized_status in closed_statuses:
+        active_orders_count = (
+            db.query(order.Order)
+            .filter(
+                order.Order.table_number == db_order.table_number,
+                order.Order.id != db_order.id,
+                order.Order.status.notin_(list(closed_statuses)),
+            )
+            .count()
+        )
+        if active_orders_count == 0 and db_table is not None:
+            db_table.is_available = True
+    elif previous_status in closed_statuses and db_table is not None:
+        db_table.is_available = False
+
     db.commit()
     db.refresh(db_order)
 
