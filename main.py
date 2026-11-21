@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from typing import List
@@ -14,6 +14,7 @@ from auth import (
     get_current_user,
     require_role,
 )
+from ws_manager import manager, authenticate_ws_token
 
 Base.metadata.create_all(bind=engine)
 
@@ -207,7 +208,7 @@ def get_tables(db: Session = Depends(get_db)):
 
 
 @app.post("/orders/", response_model=OrderResponse)
-def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
+async def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
     total = 0.0
 
     db_order = order.Order(table_number=ord_data.table_number, status="NEW")
@@ -233,6 +234,19 @@ def create_order(ord_data: OrderCreate, db: Session = Depends(get_db)):
     db_order.total_price = total
     db.commit()
     db.refresh(db_order)
+
+    await manager.broadcast(
+        {
+            "event": "order_created",
+            "order": {
+                "id": db_order.id,
+                "table_number": db_order.table_number,
+                "status": db_order.status,
+                "total_price": db_order.total_price,
+            },
+        }
+    )
+
     return db_order
 
 
@@ -242,7 +256,7 @@ def get_orders(db: Session = Depends(get_db)):
 
 
 @app.patch("/orders/{order_id}/status", response_model=OrderResponse)
-def update_order_status(
+async def update_order_status(
     order_id: int,
     new_status: str,
     db: Session = Depends(get_db),
@@ -254,5 +268,47 @@ def update_order_status(
     db_order.status = new_status
     db.commit()
     db.refresh(db_order)
+
+    await manager.broadcast(
+        {
+            "event": "order_status_updated",
+            "order": {
+                "id": db_order.id,
+                "table_number": db_order.table_number,
+                "status": db_order.status,
+                "total_price": db_order.total_price,
+            },
+        }
+    )
+
     return db_order
 
+
+
+@app.websocket("/ws/orders")
+async def orders_websocket(websocket: WebSocket, db: Session = Depends(get_db)):
+    token = websocket.query_params.get("token")
+    current_user = authenticate_ws_token(token, db)
+    if current_user is None:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+
+    await manager.connect(websocket, current_user)
+    try:
+        await websocket.send_json(
+            {
+                "event": "connected",
+                "user": {
+                    "id": current_user.id,
+                    "username": current_user.username,
+                    "role": current_user.role,
+                },
+            }
+        )
+        while True:
+            
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+    except Exception:
+        manager.disconnect(websocket)
